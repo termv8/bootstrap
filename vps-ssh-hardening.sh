@@ -1,155 +1,327 @@
 #!/bin/bash
 #
-# vps-ssh-hardening.sh — new-VPS first-boot SSH hardening (Debian/Ubuntu)
+# vps-ssh-hardening.sh — 新 VPS 一键安全加固
+# 支持: Debian / Ubuntu / Alpine
 #
-# Rewritten from FunctionClub/Fail2ban. What changed:
-#  - modern fail2ban jails: [sshd] + [recidive] (old script used the
-#    obsolete [ssh-iptables] name and hardcoded port=ssh, so a custom
-#    SSH port was never actually protected)
-#  - ban action targets the real SSH port you choose
-#  - installs rsyslog when needed (Debian 12 has no /var/log/auth.log
-#    without it, and fail2ban refuses to start)
-#  - 'filter = recidive' is set explicitly (stock jail.conf omits it,
-#    the jail silently fails without it)
-#  - interactive: SSH port, maxretry, findtime, bantime, recidive on/off
-#  - disables password login ONLY after you prove the key works in a
-#    separate session (two-phase, no lockout risk)
+# 功能:
+#  [必做] 系统更新到最新
+#  [必做] fail2ban (sshd 监狱 + recidive 惯犯监狱)
+#  [必做] SSH: 自定义端口 + 密钥登录(两步验证,防锁死)
+#  [可选] 设置时区
+#  [可选] unattended-upgrades 自动安全更新 (仅 Debian/Ubuntu)
+#  [可选] UFW 防火墙,默认只放行 SSH (仅 Debian/Ubuntu)
+#  [可选] sysctl 内核加固 (防 IP 欺骗/SYN 洪水/重定向攻击等)
+#  [可选] 新建 sudo 管理用户
 #
-# Usage: upload your .pub key to the server first, then as root:
-#        bash vps-ssh-hardening.sh
+# 注意:
+#  - Alpine 请先安装 bash: apk add bash
+#  - 用法: bash <(curl -sL https://raw.githubusercontent.com/USER/REPO/main/vps-ssh-hardening.sh)
 #
 
-# ---------- colors ----------
+# ================= 基础函数 =================
 CFAILURE="\033[31m"; CWARNING="\033[33m"; CMSG="\033[36m"; COK="\033[32m"; CEND="\033[0m"
 info() { echo -e "${CMSG}$*${CEND}"; }
 ok()   { echo -e "${COK}$*${CEND}"; }
 warn() { echo -e "${CWARNING}$*${CEND}"; }
 fail() { echo -e "${CFAILURE}$*${CEND}"; exit 1; }
 
-# ---------- must be root ----------
-[ "$(id -u)" = "0" ] || fail "Error: You must be root to run this script."
+[ "$(id -u)" = "0" ] || fail "错误：请用 root 用户运行此脚本。"
 
-# ---------- OS check (Debian/Ubuntu) ----------
+# ================= 系统识别 =================
+OS_ID=""; PRETTY_NAME="未知"
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     . /etc/os-release
-else
-    fail "Cannot detect OS."
+    OS_ID="$ID"
 fi
-case "$ID" in
-    debian|ubuntu) ;;
-    *) fail "This script supports Debian/Ubuntu only (detected: $ID)." ;;
+case "$OS_ID" in
+    debian|ubuntu) PKG="apt"; INIT="systemd"; SSH_SVC="ssh" ;;
+    alpine)        PKG="apk"; INIT="openrc";  SSH_SVC="sshd" ;;
+    *) fail "此脚本仅支持 Debian / Ubuntu / Alpine（检测到：$OS_ID）。" ;;
 esac
-info "Detected OS: $PRETTY_NAME"
+info "检测到系统：$PRETTY_NAME"
 echo ""
 
-# ---------- 1. SSH port ----------
+pkg_install() {
+    if [ "$PKG" = "apt" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null 2>&1
+    else
+        apk add --no-cache "$@" >/dev/null 2>&1
+    fi
+}
+svc_enable() {
+    if [ "$INIT" = "systemd" ]; then
+        systemctl enable "$1" >/dev/null 2>&1
+    else
+        rc-update add "$1" default >/dev/null 2>&1
+    fi
+}
+svc_restart() {
+    if [ "$INIT" = "systemd" ]; then
+        systemctl restart "$1"
+    else
+        rc-service "$1" restart
+    fi
+}
+svc_active() {
+    if [ "$INIT" = "systemd" ]; then
+        systemctl is-active --quiet "$1"
+    else
+        rc-service "$1" status >/dev/null 2>&1
+    fi
+}
+ask_yn() {
+    local prompt="$1" def="$2" ans
+    while true; do
+        if [ "$def" = "Y" ]; then
+            read -rp "$prompt [Y/n]: " ans
+        else
+            read -rp "$prompt [y/N]: " ans
+        fi
+        ans=${ans:-$def}
+        case "$ans" in
+            [Yy]) echo "yes"; return ;;
+            [Nn]) echo "no"; return ;;
+            *) warn "请输入 y 或 n。" ;;
+        esac
+    done
+}
+
+# ================= 1. SSH 端口 =================
 cur_port=$(grep -E "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
 [ -z "$cur_port" ] && cur_port=22
-while :; do
-    read -rp "SSH port (current: $cur_port, Enter to keep): " SSH_PORT
+while true; do
+    read -rp "SSH 端口（当前：$cur_port，直接回车保持不变）: " SSH_PORT
     [ -z "$SSH_PORT" ] && SSH_PORT=$cur_port
-    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
-        break
-    fi
-    warn "Invalid port. Enter a number between 1 and 65535."
+    case "$SSH_PORT" in
+        ''|*[!0-9]*) warn "端口无效，请输入 1-65535 之间的数字。" ;;
+        *)
+            if [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; then
+                break
+            fi
+            warn "端口无效，请输入 1-65535 之间的数字。"
+            ;;
+    esac
 done
-if [ "$SSH_PORT" = "22" ]; then
-    warn "Port 22 is the most scanned port on the internet. A custom port is strongly recommended."
-fi
+[ "$SSH_PORT" = "22" ] && warn "22 是全网被扫描最多的端口，强烈建议换一个自定义端口。"
 echo ""
 
-# ---------- 2. fail2ban parameters ----------
-while :; do
-    read -rp "Max failed logins before ban [2-10] (default 5): " MAXRETRY
+# ================= 2. fail2ban 参数 =================
+while true; do
+    read -rp "封禁前允许失败几次 [2-10]（默认 5）: " MAXRETRY
     [ -z "$MAXRETRY" ] && MAXRETRY=5
-    if [[ "$MAXRETRY" =~ ^[0-9]+$ ]] && [ "$MAXRETRY" -ge 2 ] && [ "$MAXRETRY" -le 10 ]; then break; fi
-    warn "Enter a number between 2 and 10."
+    case "$MAXRETRY" in
+        ''|*[!0-9]*) warn "请输入 2-10 之间的数字。" ;;
+        *)
+            if [ "$MAXRETRY" -ge 2 ] && [ "$MAXRETRY" -le 10 ]; then break; fi
+            warn "请输入 2-10 之间的数字。"
+            ;;
+    esac
 done
-while :; do
-    read -rp "Time window in minutes for counting failures (default 10): " FINDTIME
+while true; do
+    read -rp "统计失败次数的时间窗口，单位分钟（默认 10）: " FINDTIME
     [ -z "$FINDTIME" ] && FINDTIME=10
-    if [[ "$FINDTIME" =~ ^[0-9]+$ ]] && [ "$FINDTIME" -ge 1 ]; then break; fi
-    warn "Enter a positive number."
+    case "$FINDTIME" in
+        ''|*[!0-9]*) warn "请输入一个正数。" ;;
+        *)
+            if [ "$FINDTIME" -ge 1 ]; then break; fi
+            warn "请输入一个正数。"
+            ;;
+    esac
 done
-info "Ban duration:"
-info "  1) 10 minutes"
-info "  2) 1 hour"
-info "  3) 24 hours"
-info "  4) 1 week"
-info "  5) Custom (hours)"
-while :; do
-    read -rp "Choose [1-5] (default 2): " BC
+info "封禁时长："
+info "  1) 10 分钟"
+info "  2) 1 小时"
+info "  3) 24 小时"
+info "  4) 1 周"
+info "  5) 自定义（小时）"
+while true; do
+    read -rp "请选择 [1-5]（默认 2）: " BC
     [ -z "$BC" ] && BC=2
     case "$BC" in
         1) BANTIME="10m"; break ;;
         2) BANTIME="1h";  break ;;
         3) BANTIME="24h"; break ;;
         4) BANTIME="1w";  break ;;
-        5) read -rp "Custom ban time in hours: " BH
-           if [[ "$BH" =~ ^[0-9]+$ ]] && [ "$BH" -ge 1 ]; then BANTIME="${BH}h"; break; fi
-           warn "Enter a positive number." ;;
-        *) warn "Choose 1-5." ;;
+        5)
+            read -rp "自定义封禁时长（小时）: " BH
+            case "$BH" in
+                ''|*[!0-9]*) warn "请输入一个正数。" ;;
+                *)
+                    if [ "$BH" -ge 1 ]; then BANTIME="${BH}h"; break; fi
+                    warn "请输入一个正数。"
+                    ;;
+            esac
+            ;;
+        *) warn "请选择 1-5。" ;;
     esac
 done
-while :; do
-    read -rp "Enable recidive jail (1-week ban for repeat offenders)? [Y/n]: " RC
-    RC=${RC:-Y}
-    if [[ "$RC" =~ ^[Yy]$ ]]; then RECIDIVE="yes"; break
-    elif [[ "$RC" =~ ^[Nn]$ ]]; then RECIDIVE="no"; break
-    else warn "Please answer y or n."; fi
-done
+RECIDIVE=$(ask_yn "是否启用惯犯监狱（屡犯者封 1 周）？" "Y")
 echo ""
 
-# ---------- 3. SSH public key ----------
-info "Password login will be DISABLED at the end. You must provide an SSH public key."
-info "Upload your .pub file to this server first, e.g.: scp ~/.ssh/id_ed25519.pub root@server:/root/"
-KEY_PATH=""
-while :; do
-    read -rp "Path to your public key file on this server: " KEY_PATH
-    [ -f "$KEY_PATH" ] || { warn "File not found: $KEY_PATH"; continue; }
-    KEY_TYPE=$(awk '{print $1}' "$KEY_PATH")
-    case "$KEY_TYPE" in
-        ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)
-            break ;;
-        *) warn "Not a valid SSH public key (starts with: $KEY_TYPE)." ;;
+# ================= 3. 时区 =================
+read -rp "设置时区（默认 Asia/Shanghai，直接回车跳过）: " TZ_IN
+TZ_IN=${TZ_IN:-Asia/Shanghai}
+if [ ! -f "/usr/share/zoneinfo/$TZ_IN" ]; then
+    warn "时区 $TZ_IN 不存在，将跳过时区设置（如需请先安装 tzdata）。"
+    SET_TZ="no"
+else
+    SET_TZ="yes"
+fi
+echo ""
+
+# ================= 4. 可选加固项 =================
+if [ "$PKG" = "apt" ]; then
+    AUTO_UPGRADE=$(ask_yn "启用自动安全更新（unattended-upgrades）？" "Y")
+    USE_UFW=$(ask_yn "启用 UFW 防火墙（默认拒绝入站，只放行 SSH）？" "N")
+    if [ "$USE_UFW" = "yes" ]; then
+        read -rp "除 SSH 外还要放行的端口（逗号分隔，如 80,443，直接回车则只放行 SSH）: " EXTRA_PORTS
+    fi
+else
+    info "Alpine 跳过自动更新与 UFW（可用 apk 手动管理）。"
+    AUTO_UPGRADE="no"; USE_UFW="no"; EXTRA_PORTS=""
+fi
+USE_SYSCTL=$(ask_yn "应用 sysctl 内核加固（防欺骗/SYN洪水/重定向攻击）？" "Y")
+echo ""
+
+# ================= 5. SSH 公钥 =================
+info "注意：最后会禁用密码登录，你必须提供一个 SSH 公钥。"
+info "三种提供方式：服务器上的 .pub 文件路径、直接粘贴公钥内容、"
+info "或一个 URL（例如 https://github.com/你的用户名.keys）。"
+PUBKEY=""
+while [ -z "$PUBKEY" ]; do
+    read -rp "公钥（文件路径 / 粘贴 / URL）: " KEY_INPUT
+    [ -z "$KEY_INPUT" ] && { warn "输入为空。"; continue; }
+    CANDIDATE=""
+    case "$KEY_INPUT" in
+        http://*|https://*)
+            info "正在从 URL 获取公钥..."
+            CANDIDATE=$(curl -fsSL --max-time 15 "$KEY_INPUT" 2>/dev/null | head -5)
+            if [ -z "$CANDIDATE" ]; then warn "从 URL 获取失败。"; continue; fi
+            ;;
+        ssh-rsa*|ssh-ed25519*|ecdsa-sha2-nistp*)
+            CANDIDATE="$KEY_INPUT"
+            ;;
+        *)
+            if [ -f "$KEY_INPUT" ]; then
+                CANDIDATE=$(cat "$KEY_INPUT")
+            else
+                warn "既不是文件、URL，也不是公钥，请重试。"
+                continue
+            fi
+            ;;
     esac
+    while IFS= read -r line; do
+        case "$line" in
+            ssh-rsa*|ssh-ed25519*|ecdsa-sha2-nistp*|sk-ssh-ed25519*|sk-ecdsa-sha2-nistp*)
+                PUBKEY="$line"; break ;;
+        esac
+    done <<EOF_CANDIDATE
+$CANDIDATE
+EOF_CANDIDATE
+    [ -z "$PUBKEY" ] && warn "输入中没有找到有效的 SSH 公钥。"
 done
-read -rp "Install the key for which user? (default: root): " KEY_USER
+ok "公钥已接受。"
+read -rp "把公钥装给哪个用户？（默认 root）: " KEY_USER
 KEY_USER=${KEY_USER:-root}
-id "$KEY_USER" >/dev/null 2>&1 || fail "User $KEY_USER does not exist."
+id "$KEY_USER" >/dev/null 2>&1 || fail "用户 $KEY_USER 不存在。"
 USER_HOME=$(eval echo "~$KEY_USER")
 echo ""
 
-# ---------- summary & confirm ----------
-info "================ Summary ================"
-info "SSH port:        $SSH_PORT"
-info "fail2ban:        $MAXRETRY failures / ${FINDTIME}min  ->  ban $BANTIME"
-info "recidive jail:   $RECIDIVE"
-info "Key for user:    $KEY_USER  ($USER_HOME/.ssh/authorized_keys)"
-info "Password login:  DISABLED after key is verified"
-info "========================================="
-while :; do
-    read -rp "Proceed? [y/n]: " GO
-    if [[ "$GO" =~ ^[Yy]$ ]]; then break
-    elif [[ "$GO" =~ ^[Nn]$ ]]; then info "Aborted, nothing changed."; exit 0
-    else warn "Please answer y or n."; fi
-done
+# ================= 6. 可选：新建 sudo 用户 =================
+NEW_USER=""
+DISABLE_ROOT_SSH="no"
+if [ "$(ask_yn "是否新建一个 sudo 管理用户（可选）？" "N")" = "yes" ]; then
+    while true; do
+        read -rp "新用户名（小写字母开头）: " NEW_USER
+        case "$NEW_USER" in
+            [a-z]*)
+                if id "$NEW_USER" >/dev/null 2>&1; then
+                    warn "用户已存在，换一个。"
+                    continue
+                fi
+                break
+                ;;
+            *) warn "用户名不合法。" ;;
+        esac
+    done
+    read -rp "把公钥同时装给 $NEW_USER 吗？[Y/n]: " KEY_FOR_NEW
+    KEY_FOR_NEW=${KEY_FOR_NEW:-Y}
+    DISABLE_ROOT_SSH=$(ask_yn "是否禁止 root 直接 SSH 登录（只能用 $NEW_USER 登录）？" "N")
+fi
 echo ""
 
-# ---------- 4. install fail2ban (+ rsyslog for /var/log/auth.log) ----------
-info "[1/6] Installing fail2ban..."
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban rsyslog \
-    || fail "apt install failed."
-# fail2ban's sshd jail needs /var/log/auth.log; Debian 12 only has it with rsyslog
-[ -f /var/log/auth.log ] || touch /var/log/auth.log
-systemctl enable fail2ban >/dev/null 2>&1
+# ================= 确认 =================
+info "================ 配置确认 ================"
+info "SSH 端口：       $SSH_PORT"
+info "fail2ban：       ${FINDTIME}分钟内失败 $MAXRETRY 次 -> 封 $BANTIME"
+info "惯犯监狱：       $RECIDIVE"
+[ "$SET_TZ" = "yes" ] && info "时区：           $TZ_IN"
+[ "$PKG" = "apt" ] && info "自动安全更新：   $AUTO_UPGRADE"
+[ "$PKG" = "apt" ] && info "UFW 防火墙：      $USE_UFW"
+info "sysctl 加固：     $USE_SYSCTL"
+info "公钥用户：       $KEY_USER"
+[ -n "$NEW_USER" ] && info "新建 sudo 用户：  $NEW_USER"
+[ "$DISABLE_ROOT_SSH" = "yes" ] && info "禁止 root 登录： 是"
+info "密码登录：       密钥验证通过后禁用"
+info "=========================================="
+if [ "$(ask_yn "确认执行？" "Y")" = "no" ]; then
+    info "已取消，未做任何更改。"
+    exit 0
+fi
+echo ""
 
-# ---------- 5. write jail.local ----------
-info "[2/6] Writing /etc/fail2ban/jail.local ..."
-[ -f /etc/fail2ban/jail.local ] && cp /etc/fail2ban/jail.local "/etc/fail2ban/jail.local.bak-$(date +%F_%T)"
-cat > /etc/fail2ban/jail.local <<EOF
+# ================= 执行 =================
+# ---- 1/8 系统更新 ----
+info "[1/8] 正在更新系统..."
+if [ "$PKG" = "apt" ]; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq >/dev/null 2>&1
+else
+    apk update >/dev/null 2>&1
+    apk upgrade >/dev/null 2>&1
+fi
+ok "系统更新完成。"
+
+# ---- 2/8 时区 ----
+if [ "$SET_TZ" = "yes" ]; then
+    info "[2/8] 设置时区为 $TZ_IN ..."
+    if [ "$INIT" = "systemd" ]; then
+        timedatectl set-timezone "$TZ_IN" 2>/dev/null
+    else
+        pkg_install tzdata
+        ln -sf "/usr/share/zoneinfo/$TZ_IN" /etc/localtime
+        echo "$TZ_IN" > /etc/timezone
+    fi
+    ok "当前时间：$(date)"
+fi
+
+# ---- 3/8 安装基础软件 ----
+info "[3/8] 正在安装 fail2ban、rsyslog 等..."
+if [ "$PKG" = "apk" ]; then
+    pkg_install openssh fail2ban rsyslog sudo curl
+    ssh-keygen -A >/dev/null 2>&1
+    svc_enable sshd
+    svc_enable rsyslog
+    svc_enable fail2ban
+else
+    pkg_install fail2ban rsyslog sudo curl
+    if [ "$USE_UFW" = "yes" ]; then pkg_install ufw; fi
+    if [ "$AUTO_UPGRADE" = "yes" ]; then pkg_install unattended-upgrades; fi
+fi
+if ! grep -qr "auth.log" /etc/rsyslog.conf /etc/rsyslog.d/ 2>/dev/null; then
+    echo "auth,authpriv.*    /var/log/auth.log" > /etc/rsyslog.d/10-auth.conf
+fi
+[ -f /var/log/auth.log ] || touch /var/log/auth.log
+svc_enable fail2ban
+ok "基础软件安装完成。"
+
+# ---- 4/8 fail2ban 配置 ----
+info "[4/8] 正在配置 fail2ban ..."
+if [ -f /etc/fail2ban/jail.local ]; then
+    cp /etc/fail2ban/jail.local "/etc/fail2ban/jail.local.bak-$(date +%F_%T)"
+fi
+cat > /etc/fail2ban/jail.local <<EOF_JAIL
 # Generated by vps-ssh-hardening.sh on $(date +%F_%T)
 [DEFAULT]
 ignoreip = 127.0.0.1/8
@@ -162,9 +334,9 @@ logpath  = /var/log/auth.log
 maxretry = $MAXRETRY
 findtime = ${FINDTIME}m
 bantime  = $BANTIME
-EOF
+EOF_JAIL
 if [ "$RECIDIVE" = "yes" ]; then
-cat >> /etc/fail2ban/jail.local <<'EOF'
+cat >> /etc/fail2ban/jail.local <<'EOF_RECIDIVE'
 
 [recidive]
 enabled  = true
@@ -173,74 +345,158 @@ logpath  = /var/log/fail2ban.log
 maxretry = 3
 findtime = 1d
 bantime  = 1w
-EOF
+EOF_RECIDIVE
 fi
 
-# ---------- 6. set SSH port + install key (password auth STAYS ON for now) ----------
-info "[3/6] Setting SSH port to $SSH_PORT and installing your public key ..."
+# ---- 5/8 sysctl 加固 ----
+if [ "$USE_SYSCTL" = "yes"]; then
+info "[5/8] 正在应用 sysctl 内核加固..."
+cat > /etc/sysctl.d/99-vps-hardening.conf <<'EOF_SYSCTL'
+# Generated by vps-ssh-hardening.sh
+# 防 IP 欺骗 / SYN 洪水 / ICMP 重定向攻击
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.perf_event_paranoid = 2
+EOF_SYSCTL
+sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-vps-hardening.conf >/dev/null 2>&1
+ok "sysctl 加固已应用。"
+fi
+
+# ---- 6/8 自动更新 + 防火墙 (Debian/Ubuntu) ----
+if [ "$AUTO_UPGRADE" = "yes"]; then
+info "[6/8] 正在启用自动安全更新..."
+svc_enable apt-daily-upgrade.timer
+svc_enable apt-daily.timer
+ok "自动安全更新已启用。"
+fi
+if [ "$USE_UFW" = "yes"]; then
+info "[6/8] 正在配置 UFW 防火墙..."
+ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1
+if [ -n "$EXTRA_PORTS"]; then
+for p in $(echo "$EXTRA_PORTS" | tr ',' ' '); do
+ufw allow "${p}/tcp" >/dev/null 2>&1
+done
+fi
+ufw --force enable >/dev/null 2>&1
+ok "UFW 已启用。"
+fi
+
+# ---- 7/8 SSH: 端口 + 公钥 (密码登录暂保留) ----
+info "[7/8] 正在设置 SSH 端口并安装公钥..."
 cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak-$(date +%F_%T)"
 if grep -qE "^#?Port" /etc/ssh/sshd_config; then
-    sed -i -E "s/^#?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+sed -i -E "s/^#?Port.*/Port $SSH_PORT/" /etc/ssh/sshd_config
 else
-    echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
+echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
 fi
-mkdir -p "$USER_HOME/.ssh"
-chmod 700 "$USER_HOME/.ssh"
-touch "$USER_HOME/.ssh/authorized_keys"
-chmod 600 "$USER_HOME/.ssh/authorized_keys"
-PUBKEY=$(cat "$KEY_PATH")
-grep -qxF "$PUBKEY" "$USER_HOME/.ssh/authorized_keys" 2>/dev/null \
-    || echo "$PUBKEY" >> "$USER_HOME/.ssh/authorized_keys"
-chown -R "$KEY_USER:$KEY_USER" "$USER_HOME/.ssh"
+install_key() {
+local u="$1" home
+home=$(eval echo "~$u")
+mkdir -p "$home/.ssh"
+chmod 700 "$home/.ssh"
+touch "$home/.ssh/authorized_keys"
+chmod 600 "$home/.ssh/authorized_keys"
+if ! grep -qxF "$PUBKEY" "$home/.ssh/authorized_keys" 2>/dev/null; then
+echo "$PUBKEY" >> "$home/.ssh/authorized_keys"
+fi
+chown -R "$u:$u" "$home/.ssh"
+}
+install_key "$KEY_USER"
+if [ -n "$NEW_USER"]; then
+info "正在创建 sudo 用户 $NEW_USER..."
+if [ "$PKG" = "apt"]; then
+adduser --disabled-password --gecos "" "$NEW_USER" >/dev/null 2>&1
+usermod -aG sudo "$NEW_USER"
+else
+adduser -D "$NEW_USER" >/dev/null 2>&1
+addgroup "$NEW_USER" wheel >/dev/null 2>&1
+if ! grep -q "^%wheel" /etc/sudoers 2>/dev/null; then
+echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
+fi
+fi
+case "$KEY_FOR_NEW" in
+[Yy]) install_key "$NEW_USER";;
+esac
+ok "用户 $NEW_USER 已创建。"
+fi
 
-sshd -t || fail "sshd config test FAILED. Not restarting. Original saved as /etc/ssh/sshd_config.bak-*"
-systemctl restart sshd
-systemctl restart fail2ban
+sshd -t || fail "sshd 配置检查失败，不重启。原配置已备份为 /etc/ssh/sshd_config.bak-*"
+svc_restart "$SSH_SVC"
+svc_restart fail2ban 2>/dev/null
 sleep 2
-fail2ban-client status >/dev/null 2>&1 \
-    || fail "fail2ban failed to start. Run 'journalctl -u fail2ban' for details."
-ok "fail2ban running, jails:$(fail2ban-client status | grep 'Jail list' | cut -d: -f2)"
+if [ "$INIT" = "systemd"]; then
+if fail2ban-client status >/dev/null 2>&1; then
+ok "fail2ban 运行中。"
+else
+fail "fail2ban 启动失败，请运行 journalctl -u fail2ban 查看。"
+fi
+else
+if svc_active fail2ban; then
+ok "fail2ban 运行中。"
+else
+warn "请手动检查 fail2ban 状态：rc-service fail2ban status"
+fi
+fi
 
-# ---------- 7. verify key login BEFORE disabling passwords ----------
+# ---- 8/8 验证密钥后禁用密码 ----
 echo ""
-warn ">>> STEP 7: open a NEW terminal and SSH with your key:  ssh -p $SSH_PORT $KEY_USER@<server-ip>"
-warn ">>> Do NOT close THIS session until the key login is confirmed."
+warn ">>> 请打开一个，用密钥登录测试：ssh -p $SSH_PORT $KEY_USER@<服务器IP>"
+warn ">>> 在密钥登录确认成功之前，不要关闭这个窗口！"
 echo ""
-while :; do
-    read -rp "Can you log in with the SSH key in the new session? [y/n]: " KEY_OK
-    if [[ "$KEY_OK" =~ ^[Yy]$ ]]; then break
-    elif [[ "$KEY_OK" =~ ^[Nn]$ ]]; then
-        fail "Key login did NOT work. Password auth left ENABLED. Fix the key and re-run this script."
-    else warn "Please answer y or n."; fi
-done
+if [ "$(ask_yn "新终端里密钥能登录成功吗？" "Y")" = "no"]; then
+fail "密钥登录失败，密码登录保持开启。请修好密钥后重新运行此脚本。"
+fi
 
-# ---------- 8. disable password authentication ----------
-info "[4/6] Disabling password authentication ..."
+info "正在禁用密码登录..."
 for opt in PasswordAuthentication ChallengeResponseAuthentication KbdInteractiveAuthentication; do
-    if grep -qE "^#?$opt" /etc/ssh/sshd_config; then
-        sed -i -E "s/^#?$opt .*/$opt no/" /etc/ssh/sshd_config
-    else
-        echo "$opt no" >> /etc/ssh/sshd_config
-    fi
+if grep -qE "^#?$opt" /etc/ssh/sshd_config; then
+sed -i -E "s/^#?$opt.*/$opt no/" /etc/ssh/sshd_config
+else
+echo "$opt no" >> /etc/ssh/sshd_config
+fi
 done
 if grep -qE "^#?PubkeyAuthentication" /etc/ssh/sshd_config; then
-    sed -i -E "s/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+sed -i -E "s/^#?PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
 else
-    echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
+echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
 fi
-sshd -t || fail "sshd config test FAILED. Not restarting."
-systemctl restart sshd
-ok "Password login DISABLED. Key-only authentication is now enforced."
+if [ "$DISABLE_ROOT_SSH" = "yes"]; then
+if grep -qE "^#?PermitRootLogin" /etc/ssh/sshd_config; then
+sed -i -E "s/^#?PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
+else
+echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+fi
+info "已禁止 root 直接 SSH 登录。"
+fi
+sshd -t || fail "sshd 配置检查失败，不重启。"
+svc_restart "$SSH_SVC"
+ok "密码登录已禁用，现在只能用密钥登录。"
 
-# ---------- 9. final report ----------
+# ================= 完成报告 =================
 echo ""
-info "================ Done ================"
-info "Effective sshd settings:"
-sshd -T 2>/dev/null | grep -iE "^(port|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication)"
-echo ""
-info "fail2ban:"
-fail2ban-client status
+info "================ 完成 ================"
+info "SSH 端口：$SSH_PORT（密钥登录）"
+[ -n "$NEW_USER"] && info "管理用户：$NEW_USER（sudo）"
+info "fail2ban：${FINDTIME}分钟内失败 $MAXRETRY 次 -> 封 $BANTIME"
+[ "$RECIDIVE" = "yes"] && info "惯犯监狱：已启用（屡犯封 1 周）"
+[ "$USE_SYSCTL" = "yes"] && info "sysctl 内核加固：已应用"
+[ "$USE_UFW" = "yes"] && info "UFW 防火墙：已启用"
+[ "$AUTO_UPGRADE" = "yes"] && info "自动安全更新：已启用"
 info "======================================="
 echo ""
-warn "Reminder: open port $SSH_PORT in your cloud security group / firewall, or you will lock yourself out."
-warn "If you ever lose the private key, regain access via your provider's web console (VNC)."
+warn "提醒：去云厂商安全组放行 $SSH_PORT 端口，否则连不上！"
+warn "如果私钥丢了，用云厂商的网页控制台（VNC）进去恢复。"

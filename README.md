@@ -1,66 +1,87 @@
 # vps-ssh-hardening
 
-A first-boot SSH hardening script for new VPS (Debian / Ubuntu).
+新 VPS 一键安全加固脚本，支持 **Debian / Ubuntu / Alpine**，全中文交互。
 
-Sets up **fail2ban** with modern jails, moves SSH to a custom port, and switches login to **key-only** — with a safe two-phase flow that never locks you out.
+配置 **fail2ban** 现代化监狱、SSH 自定义端口、切换为 **仅密钥登录**，并用两步验证流程确保不会把自己锁在门外。
 
-## Features
+## 功能
 
-- **Interactive setup** — SSH port, max retries, find-time window, ban duration (presets or custom), recidive jail on/off. Sensible defaults throughout, so you can just press Enter.
-- **Modern fail2ban config** — uses the current `[sshd]` jail plus a `[recidive]` jail for repeat offenders, with the ban action bound to your *actual* SSH port (not the hardcoded `port=ssh` of older scripts).
-- **Key-only login, safely** — the script installs your public key first but keeps password auth enabled until *you* confirm a key login works in a fresh session. Only then is password auth disabled.
-- **Debian 12 ready** — installs `rsyslog` when missing so `/var/log/auth.log` exists (fail2ban refuses to start without it), and writes `filter = recidive` explicitly (the stock `jail.conf` omits it and the recidive jail silently fails).
-- **Reversible** — `sshd_config` and `jail.local` are backed up with timestamps before every change, and `sshd -t` validates the config before each restart.
+**必做项：**
 
-## Requirements
+- **系统更新** — 开机先把系统升级到最新
+- **交互式配置** — SSH 端口、最大失败次数、统计窗口、封禁时长（预设或自定义）、惯犯监狱开关，全有默认值，一路回车也行
+- **现代化 fail2ban** — `[sshd]` 监狱 + `[recidive]` 惯犯监狱，封禁动作绑定你*实际*的 SSH 端口（老脚本写死 `port=ssh`，改了端口根本不生效）
+- **仅密钥登录，不锁死** — 先装好公钥，但密码登录保持开启，直到你*在新终端确认密钥登录成功*，才禁用密码
 
-- Debian 11/12 or Ubuntu (systemd)
-- Root access
-- An SSH key pair on your local machine (e.g. `ssh-keygen -t ed25519`)
+**可选项：**
 
-## Usage
+- **时区设置**（默认 Asia/Shanghai）
+- **自动安全更新** unattended-upgrades（仅 Debian/Ubuntu）
+- **UFW 防火墙**（仅 Debian/Ubuntu，默认拒绝入站，可追加放行端口）
+- **sysctl 内核加固**（防 IP 欺骗、SYN 洪水、ICMP 重定向攻击、内核指针泄露等 17 项）
+- **新建 sudo 管理用户**（可顺带禁止 root 直接 SSH 登录）
 
-1. Generate a key if you don't have one:
+**兼容与安全细节：**
+
+- Debian 12 缺失 `/var/log/auth.log` 会导致 fail2ban 无法启动 —— 脚本自动补装 rsyslog 并配置日志规则
+- `filter = recidive` 显式写入（官方 `jail.conf` 缺这一行，惯犯监狱会静默失效）
+- 每次修改前都带时间戳备份 `sshd_config` 和 `jail.local`，且每次重启前都跑 `sshd -t` 校验配置，可回滚
+
+## 要求
+
+- Debian / Ubuntu（systemd）或 Alpine（OpenRC，需先 `apk add bash`）
+- root 权限
+- 本地有一对 SSH 密钥（如 `ssh-keygen -t ed25519`）
+
+## 使用
+
+新机器上一行命令（root 执行）：
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/termv8/引导程序/main/vps-ssh-hardening.sh)
+```
+
+提示输入公钥时，三种给法都行：直接粘贴公钥内容、填 `.pub` 文件路径、或填 URL（如 `https://github.com/你的用户名.keys`）。
+
+想手动跑的话：
+
+1. 没有密钥先生成一个：
 
    ```bash
    ssh-keygen -t ed25519
    ```
 
-2. Upload your **public** key to the server:
+2. 下载并运行脚本：
 
    ```bash
-   scp ~/.ssh/id_ed25519.pub root@<server-ip>:/root/
-   ```
-
-3. Run the script as root:
-
-   ```bash
+   curl -O https://raw.githubusercontent.com/termv8/引导程序/main/vps-ssh-hardening.sh
    bash vps-ssh-hardening.sh
    ```
 
-4. Answer the prompts. When the script asks, open a **new** terminal and verify the key login (`ssh -p <port> root@<server-ip>`) before confirming — the script will not disable password auth until you do.
+3. 按提示回答。脚本让你确认时，在**新终端**里验证密钥登录（`ssh -p 端口 用户@服务器IP`）成功后再回车 —— 确认之前密码登录不会被禁用。
 
-5. Don't forget to open the new SSH port in your cloud provider's security group / firewall.
+4. 别忘了去云厂商安全组 / 防火墙放行新的 SSH 端口。
 
-## What it changes
+## 改动内容
 
-| Item | Change |
+| 文件 / 项 | 改动 |
 |---|---|
-| `/etc/ssh/sshd_config` | `Port` set to your choice; after key verification: `PasswordAuthentication no`, `ChallengeResponseAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes` |
-| `/etc/fail2ban/jail.local` | `[sshd]` jail with your parameters (+ `[recidive]` if enabled) |
-| `~/.ssh/authorized_keys` | Your public key appended for the chosen user (default `root`) |
-| Packages | `fail2ban`, `rsyslog` installed via apt |
+| `/etc/ssh/sshd_config` | `Port` 改为所选端口；密钥验证后：`PasswordAuthentication no`、`ChallengeResponseAuthentication no`、`KbdInteractiveAuthentication no`、`PubkeyAuthentication yes`（可选 `PermitRootLogin no`） |
+| `/etc/fail2ban/jail.local` | `[sshd]` 监狱（你的参数），启用时加 `[recidive]` |
+| `~/.ssh/authorized_keys` | 为所选用户（默认 root）添加你的公钥 |
+| `/etc/sysctl.d/99-vps-hardening.conf` | 可选：17 项内核加固参数 |
+| 软件包 | `fail2ban`、`rsyslog`，可选 `ufw`、`unattended-upgrades` |
 
-## Notes
+## 注意事项
 
-- Keep your current SSH session open until the key login is confirmed — that's the whole point of the two-phase flow.
-- If you ever lose the private key, regain access through your provider's web console (VNC) and re-add a key.
-- Re-running the script is safe: backups are created each time and an already-installed key is not duplicated.
+- 密钥登录确认之前，**不要关闭当前 SSH 窗口** —— 这正是两步流程的意义
+- 私钥丢了的话，用云厂商网页控制台（VNC）进去重新添加公钥
+- 重复运行是安全的：每次都会重新备份，已装过的公钥不会重复添加
 
-## Credits
+## 致谢
 
-Rewritten from [FunctionClub/Fail2ban](https://github.com/FunctionClub/Fail2ban), updated for current fail2ban and Debian 12.
+改编自 [FunctionClub/Fail2ban](https://github.com/FunctionClub/Fail2ban)，针对现代 fail2ban 与 Debian 12 做了更新，并扩展了多系统与多项加固。
 
-## License
+## 许可证
 
-MIT — see [LICENSE](LICENSE).
+MIT —— 见 [LICENSE](LICENSE)。
