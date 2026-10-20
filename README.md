@@ -21,28 +21,35 @@ Sets up **fail2ban** with modern jails, moves SSH to a custom port, and switches
 ## Usage
 
 1. Generate a key if you don't have one:
+
    ```bash
    ssh-keygen -t ed25519
    ```
+
 2. Upload your **public** key to the server:
+
    ```bash
    scp ~/.ssh/id_ed25519.pub root@<server-ip>:/root/
    ```
+
 3. Run the script as root:
+
    ```bash
    bash vps-ssh-hardening.sh
    ```
+
 4. Answer the prompts. When the script asks, open a **new** terminal and verify the key login (`ssh -p <port> root@<server-ip>`) before confirming — the script will not disable password auth until you do.
+
 5. Don't forget to open the new SSH port in your cloud provider's security group / firewall.
 
 ## What it changes
 
-| Item                       | Change                                                                                                                                                                              |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/etc/ssh/sshd_config`     | `Port` set to your choice; after key verification: `PasswordAuthentication no`, `ChallengeResponseAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes` |
-| `/etc/fail2ban/jail.local` | `[sshd]` jail with your parameters (+ `[recidive]` if enabled)                                                                                                                      |
-| `~/.ssh/authorized_keys`   | Your public key appended for the chosen user (default `root`)                                                                                                                       |
-| Packages                   | `fail2ban`, `rsyslog` installed via apt                                                                                                                                             |
+| Item | Change |
+|---|---|
+| `/etc/ssh/sshd_config` | `Port` set to your choice; after key verification: `PasswordAuthentication no`, `ChallengeResponseAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes` |
+| `/etc/fail2ban/jail.local` | `[sshd]` jail with your parameters (+ `[recidive]` if enabled) |
+| `~/.ssh/authorized_keys` | Your public key appended for the chosen user (default `root`) |
+| Packages | `fail2ban`, `rsyslog` installed via apt |
 
 ## Notes
 
