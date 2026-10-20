@@ -275,6 +275,24 @@ echo ""
 # ---- 1/8 系统更新 ----
 info "[1/8] 正在更新系统..."
 if [ "$PKG" = "apt" ]; then
+    # Debian 9/10 已停止维护,主镜像站不再提供,自动切换到 archive.debian.org
+    if [ "$OS_ID" = "debian" ]; then
+        case "${VERSION_ID%%.*}" in
+            9|10)
+                if grep -qE "mirrors|deb.debian.org|security.debian.org" /etc/apt/sources.list 2>/dev/null; then
+                    warn "检测到 Debian $VERSION_ID 已停止维护,切换 apt 源到 archive.debian.org ..."
+                    cp /etc/apt/sources.list "/etc/apt/sources.list.bak-$(date +%F_%T)"
+                    codename=$(grep -m1 "^deb " /etc/apt/sources.list | awk "{print \$3}")
+                    [ -z "$codename" ] && codename="buster"
+                    printf "deb http://archive.debian.org/debian/ %s main contrib non-free\n" "$codename" > /etc/apt/sources.list
+                    printf "deb http://archive.debian.org/debian-security/ %s/updates main contrib non-free\n" "$codename" >> /etc/apt/sources.list
+                    # archive 的 Release 文件已过期,关闭有效期检查
+                    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99-no-check-valid-until
+                    warn "建议重装为 Debian 12,旧版本不再有安全更新。"
+                fi
+                ;;
+        esac
+    fi
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq >/dev/null 2>&1
 else
